@@ -12,7 +12,7 @@ import argparse
 
 # 自定义数据集类
 class NoisyInfraredDataset(Dataset):
-    def __init__(self, IR_img, RGB_img, low_IR ,img_size=256, noise_level=0.1):
+    def __init__(self, IR_img, RGB_img, low_IR ,img_size=(800,600), noise_level=0.1):
         self.ir_files = sorted([os.path.join(IR_img, f) for f in os.listdir(IR_img)])
         self.rgb_files = sorted([os.path.join(RGB_img, f) for f in os.listdir(RGB_img)])
         self.low_ir_files = sorted([os.path.join(low_IR, f) for f in os.listdir(low_IR)])
@@ -21,7 +21,7 @@ class NoisyInfraredDataset(Dataset):
         # 图像转换
         self.img_size = img_size
         self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+            transforms.Resize(img_size),
             transforms.ToTensor(),
         ])
         self.rgb_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
@@ -152,45 +152,76 @@ class CombinedLoss(nn.Module):
         grad = self.gradient_loss(gen_img, gt_img)
         
         # 5. 组合加权损失
-        total_loss = 0.7 * l1 + 0.2 * percep + 0.1 * grad
+        total_loss = 0.7 * l1  + 0.3 * grad
         
         return {
             "total": total_loss,
             "l1": l1.item(),
-            "perceptual": percep.item(),
+            # "perceptual": percep.item(),
             # "adversarial": adv.item() if self.use_adv else 0,
             "gradient": grad.item()
         }
 
 # 训练配置
-def train_model(RGB_img, IR_img, low_IR,pretrained_path=None):
+def train_model(RGB_img, IR_img, low_IR,cudaID = None,pretrained_path=None,batch_size = 4):
     # 初始化配置
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 600
-    batch_size = 8
+    img_size = (800,600)
+    # batch_size = 8
     epochs = 100
+    
+    # 检查可用GPU数量
+    if cudaID == None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        num_gpus = torch.cuda.device_count()
+        # num_gpus = 3
+    else:
+        num_gpus = 1
+        device = torch.device(f"cuda:{cudaID}")
+        
+    
+    print(f"检测到 {num_gpus} 个可用的GPU")
     
     # 初始化模型
     model = InfraredFourierFusionModel(
-        img_size=(img_size, img_size),
+        img_size=img_size,
         origianl_channels=16
     ).to(device)
+    if num_gpus > 1:
+        print(f"使用 {num_gpus} 个GPU进行并行训练")
+        model = nn.DataParallel(model)
     
+    
+    # if pretrained_path:
+    #     try:
+    #         model.load_state_dict(torch.load(pretrained_path, map_location=device))
+    #         print(f"成功加载预训练权重: {pretrained_path}")
+    #     except Exception as e:
+    #         print(f"加载预训练权重失败: {str(e)}")
+    # 加载预训练权重（如果有）
     if pretrained_path:
         try:
-            model.load_state_dict(torch.load(pretrained_path, map_location=device))
+            # 处理多GPU训练模型的状态字典
+            state_dict = torch.load(pretrained_path, map_location=device)
+            if num_gpus <= 1 and any(key.startswith('module.') for key in state_dict):
+                # 如果预训练模型是多GPU训练的，但当前使用单GPU
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            elif num_gpus > 1 and not any(key.startswith('module.') for key in state_dict):
+                # 如果预训练模型是单GPU训练的，但当前使用多GPU
+                state_dict = {'module.' + k: v for k, v in state_dict.items()}
+            
+            model.load_state_dict(state_dict)
             print(f"成功加载预训练权重: {pretrained_path}")
         except Exception as e:
             print(f"加载预训练权重失败: {str(e)}")
     
     # 定义损失函数和优化器
-    # criterion =  nn.L1Loss()
-    criterion = CombinedLoss(device=device)
+    criterion =  nn.L1Loss()
+    # criterion = CombinedLoss(device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
     #可调整学习率
     def lr_lambda(epoch):
-        return 0.1 if epoch >= 10 else 1.0
+        return 0.1 if epoch >= 20 else 1.0
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda)
     
@@ -202,10 +233,21 @@ def train_model(RGB_img, IR_img, low_IR,pretrained_path=None):
         img_size=img_size,
         noise_level=0.05  # 可调节噪声强度
     )
+    
+    # 根据GPU数量调整批次大小
+    effective_batch_size = batch_size * max(1, num_gpus)
+    print(f"实际批次大小: {effective_batch_size} (每个GPU: {batch_size})")
+    
     train_loader = DataLoader(train_dataset, 
-                             batch_size=batch_size, 
+                             batch_size=effective_batch_size, 
                              shuffle=True,
-                             num_workers=0)
+                             num_workers=4 * num_gpus,  # 根据GPU数量增加工作线程
+                             pin_memory=True)  # 加速数据传输
+    
+    # train_loader = DataLoader(train_dataset, 
+    #                          batch_size=batch_size, 
+    #                          shuffle=True,
+    #                          num_workers=0)
    
     # 训练循环
     for epoch in range(epochs):
@@ -219,7 +261,8 @@ def train_model(RGB_img, IR_img, low_IR,pretrained_path=None):
             
             optimizer.zero_grad()
             outputs = model(low_ir, rgb)  # 输入low红外和RGB
-            loss = criterion(outputs, clean_ir)['total']  # 与干净红外比较
+            # loss = criterion(outputs, clean_ir)['total']  # 与干净红外比较(conbined loss)
+            loss = criterion(outputs, clean_ir) #L1 loss
             
             loss.backward()
             optimizer.step()
@@ -236,17 +279,18 @@ def train_model(RGB_img, IR_img, low_IR,pretrained_path=None):
         # 每个epoch的平均损失
         epoch_loss = running_loss / len(train_loader)
         print(f'Epoch [{epoch+1}/{epochs}] completed, Average Loss: {epoch_loss:.4f}')
-        #学习率更新
-        scheduler.step() 
         #当前学习率
         print(f"Epoch [{epoch+1}/{epochs}] - 当前学习率: { optimizer.param_groups[0]['lr']:.6f}")
+        #学习率更新
+        scheduler.step() 
+        
         
         # 每10个epoch结束后保存对比图
         if (epoch + 1) % 10 == 0:
             model.eval()
-            if(epoch + 1) % 20 == 0:
-                torch.save(model.state_dict(), f'checkout/temp_model_epoch{epoch+1}.pth')
-                print("临时模型已保存")
+            
+            torch.save(model.state_dict(), f'checkout/temp_model_epoch{epoch+1}.pth')
+            print("临时模型已保存")
             with torch.no_grad():
                 # 获取一个测试样本
                 sample = train_dataset[0]

@@ -79,6 +79,9 @@ class FourierFeatureExtractor(nn.Module):
             nn.ReLU()
         )
         
+        # 新增可学习残差系数 (初始化为0)
+        self.alpha = nn.Parameter(torch.tensor(0.0))  # 初始值为0，逐步学习调整
+        
         # 可学习频域滤波器
         self.freq_filter = LearnableFrequencyFilter(out_channels, img_size, init_type='highpass')
         self.final_channels = out_channels
@@ -95,12 +98,9 @@ class FourierFeatureExtractor(nn.Module):
         filtered_fft = self.freq_filter(features_fft_shifted)
         
         #改进，添加残差链接
-        res_filtered_features_fft = features_fft_shifted + filtered_fft
+        res_filtered_features_fft = features_fft_shifted + filtered_fft*self.alpha
         
-        # 4. 反变换回空间域 (可选)
-        # filtered_fft_unshifted = torch.fft.ifftshift(filtered_fft)
-        # filtered_spatial = torch.fft.ifft2(filtered_fft_unshifted).real
-        
+        # 4. 反变换回空间域 (可选)       
         filtered_fft_unshifted = torch.fft.ifftshift(res_filtered_features_fft)
         filtered_spatial = torch.fft.ifft2(filtered_fft_unshifted).real
         
