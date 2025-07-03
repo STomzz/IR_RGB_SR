@@ -2,17 +2,21 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+import torch.nn.functional as F
+from torchvision import models
 import matplotlib.pyplot as plt
 from PIL import Image
 import os
 from model.fusion import InfraredFourierFusionModel
+import argparse
 
 # 自定义数据集类
 class NoisyInfraredDataset(Dataset):
-    def __init__(self, IR_img, RGB_img, img_size=256, noise_level=0.1):
+    def __init__(self, IR_img, RGB_img, low_IR ,img_size=256, noise_level=0.1):
         self.ir_files = sorted([os.path.join(IR_img, f) for f in os.listdir(IR_img)])
         self.rgb_files = sorted([os.path.join(RGB_img, f) for f in os.listdir(RGB_img)])
-        assert len(self.ir_files) == len(self.rgb_files), "数据量不匹配"
+        self.low_ir_files = sorted([os.path.join(low_IR, f) for f in os.listdir(low_IR)])
+        assert len(self.ir_files) == len(self.rgb_files) == len(self.low_ir_files), "数据量不匹配"
         
         # 图像转换
         self.img_size = img_size
@@ -32,25 +36,139 @@ class NoisyInfraredDataset(Dataset):
         clean_ir = Image.open(self.ir_files[idx]).convert('L')
         clean_ir = self.transform(clean_ir)
         
-        # 添加噪声（输入）
-        noisy_ir = clean_ir + torch.randn_like(clean_ir) * self.noise_level
-        noisy_ir = torch.clamp(noisy_ir, 0, 1)
+        # lowir（输入）
+        low_ir = Image.open(self.low_ir_files[idx]).convert('L')
+        low_ir = self.transform(low_ir)
         
         # 加载RGB图像
         rgb_img = Image.open(self.rgb_files[idx]).convert('RGB')
         rgb_tensor = self.transform(rgb_img)
         rgb_tensor = self.rgb_normalize(rgb_tensor)
         
-        return {'noisy_ir': noisy_ir, 
+        return {'low_ir': low_ir, 
                 'rgb': rgb_tensor, 
                 'clean_ir': clean_ir}
+
+#组合损失函数
+class CombinedLoss(nn.Module):
+    def __init__(self, device='cuda', use_adv=False):
+        """
+        :param device: 计算设备 (cuda/cpu)
+        :param use_adv: 是否使用对抗损失 (需要GAN)
+        """
+        super().__init__()
+        self.device = device
+        self.use_adv = use_adv
+        
+        # L1损失 (保持与原模型一致)
+        self.l1_loss = nn.L1Loss()
+        
+        # 感知损失组件
+        self.vgg = self._init_vgg_features()
+        
+        # 梯度损失组件
+        self.sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                                   dtype=torch.float32, device=device).view(1, 1, 3, 3)
+        self.sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                                   dtype=torch.float32, device=device).view(1, 1, 3, 3)
+    
+    def _init_vgg_features(self):
+        """初始化VGG特征提取器"""
+        # 导入权重枚举类
+        from torchvision.models import VGG16_Weights
+        
+        # 使用新的权重API加载模型
+        weights = VGG16_Weights.IMAGENET1K_V1  # 或 VGG16_Weights.DEFAULT
+        
+        # 加载带权重的模型并获取特征部分
+        vgg = models.vgg16(weights=weights).features[:16]
+        
+        # 冻结参数
+        for param in vgg.parameters():
+            param.requires_grad = False
+        
+        return vgg.eval().to(self.device)
+    
+    def perceptual_loss(self, gen, gt):
+        """计算感知损失"""
+        # 单通道转三通道
+        if gen.shape[1] == 1:
+            gen = gen.repeat(1, 3, 1, 1)
+            gt = gt.repeat(1, 3, 1, 1)
+        
+        # 获取预训练权重的标准化参数（更严谨的做法）
+        from torchvision.models import VGG16_Weights
+        weights = VGG16_Weights.IMAGENET1K_V1
+        mean = weights.transforms().mean
+        std = weights.transforms().std
+        
+        # 标准化
+        mean_tensor = torch.tensor(mean).view(1, 3, 1, 1).to(self.device)
+        std_tensor = torch.tensor(std).view(1, 3, 1, 1).to(self.device)
+        
+        gen_norm = (gen - mean_tensor) / std_tensor
+        gt_norm = (gt - mean_tensor) / std_tensor
+        
+        # 提取特征并计算L1损失
+        features_gen = self.vgg(gen_norm)
+        features_gt = self.vgg(gt_norm)
+        return F.l1_loss(features_gen, features_gt)
+        
+    def gradient_loss(self, gen, gt):
+        """计算图像梯度损失"""
+        # X方向梯度
+        grad_gen_x = F.conv2d(gen, self.sobel_x, padding=1)
+        grad_gt_x = F.conv2d(gt, self.sobel_x, padding=1)
+        
+        # Y方向梯度
+        grad_gen_y = F.conv2d(gen, self.sobel_y, padding=1)
+        grad_gt_y = F.conv2d(gt, self.sobel_y, padding=1)
+        
+        loss = F.l1_loss(grad_gen_x, grad_gt_x) + F.l1_loss(grad_gen_y, grad_gt_y)
+        return loss / 2
+    
+    def forward(self, gen_img, gt_img, discriminator=None):
+        """
+        计算组合损失
+        :param gen_img: 生成图像
+        :param gt_img: 真实图像
+        :param discriminator: 判别器模型 (仅当use_adv=True时需提供)
+        """
+        # 1. L1损失
+        l1 = self.l1_loss(gen_img, gt_img)
+        
+        # 2. 感知损失
+        percep = self.perceptual_loss(gen_img, gt_img)
+                                                                                                                                                                                
+        # # 3. 对抗损失
+        # if self.use_adv and discriminator:
+        #     # 使用最小二乘GAN损失
+        #     fake_scores = discriminator(gen_img)
+        #     adv = torch.mean((fake_scores - 1) ** 2)
+        # else:
+        #     adv = torch.tensor(0.0, device=self.device)
+        
+        # 4. 梯度损失
+        grad = self.gradient_loss(gen_img, gt_img)
+        
+        # 5. 组合加权损失
+        total_loss = 0.7 * l1 + 0.2 * percep + 0.1 * grad
+        
+        return {
+            "total": total_loss,
+            "l1": l1.item(),
+            "perceptual": percep.item(),
+            # "adversarial": adv.item() if self.use_adv else 0,
+            "gradient": grad.item()
+        }
+
 # 训练配置
-def train_model(RGB_img, IR_img,pretrained_path=None):
+def train_model(RGB_img, IR_img, low_IR,pretrained_path=None):
     # 初始化配置
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 256
+    img_size = 600
     batch_size = 8
-    epochs = 500
+    epochs = 100
     
     # 初始化模型
     model = InfraredFourierFusionModel(
@@ -66,13 +184,21 @@ def train_model(RGB_img, IR_img,pretrained_path=None):
             print(f"加载预训练权重失败: {str(e)}")
     
     # 定义损失函数和优化器
-    criterion =  nn.L1Loss()
+    # criterion =  nn.L1Loss()
+    criterion = CombinedLoss(device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    #可调整学习率
+    def lr_lambda(epoch):
+        return 0.1 if epoch >= 10 else 1.0
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda)
     
     # 创建数据集和数据加载器
     train_dataset = NoisyInfraredDataset(
         IR_img=IR_img,
         RGB_img=RGB_img,
+        low_IR=low_IR,
         img_size=img_size,
         noise_level=0.05  # 可调节噪声强度
     )
@@ -87,13 +213,13 @@ def train_model(RGB_img, IR_img,pretrained_path=None):
         running_loss = 0.0
         
         for batch_idx, batch in enumerate(train_loader):
-            noisy_ir = batch['noisy_ir'].to(device)
+            low_ir = batch['low_ir'].to(device)
             rgb = batch['rgb'].to(device)
             clean_ir = batch['clean_ir'].to(device)
             
             optimizer.zero_grad()
-            outputs = model(noisy_ir, rgb)  # 输入带噪红外和RGB
-            loss = criterion(outputs, clean_ir)  # 与干净红外比较
+            outputs = model(low_ir, rgb)  # 输入low红外和RGB
+            loss = criterion(outputs, clean_ir)['total']  # 与干净红外比较
             
             loss.backward()
             optimizer.step()
@@ -105,30 +231,34 @@ def train_model(RGB_img, IR_img,pretrained_path=None):
             if batch_idx % 10 == 9:
                 print(f'Epoch [{epoch+1}/{epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
                 
-            
+           
         
         # 每个epoch的平均损失
         epoch_loss = running_loss / len(train_loader)
         print(f'Epoch [{epoch+1}/{epochs}] completed, Average Loss: {epoch_loss:.4f}')
+        #学习率更新
+        scheduler.step() 
+        #当前学习率
+        print(f"Epoch [{epoch+1}/{epochs}] - 当前学习率: { optimizer.param_groups[0]['lr']:.6f}")
         
         # 每10个epoch结束后保存对比图
         if (epoch + 1) % 10 == 0:
             model.eval()
-            if(epoch + 1) % 100 == 0:
-                torch.save(model.state_dict(), f'C:/Codes/Python/IR_RGB_SR/checkout/temp_model_epoch{epoch+1}.pth')
-                print("训练完成，临时模型已保存")
+            if(epoch + 1) % 20 == 0:
+                torch.save(model.state_dict(), f'checkout/temp_model_epoch{epoch+1}.pth')
+                print("临时模型已保存")
             with torch.no_grad():
                 # 获取一个测试样本
                 sample = train_dataset[0]
-                noisy_ir = sample['noisy_ir'].unsqueeze(0).to(device)
+                low_ir = sample['low_ir'].unsqueeze(0).to(device)
                 rgb = sample['rgb'].unsqueeze(0).to(device)
                 
                 # 生成预测
-                pred_ir = model(noisy_ir, rgb)
+                pred_ir = model(low_ir, rgb)
                 
                 # 转换为numpy图像
                 clean_img = sample['clean_ir'].squeeze().cpu().numpy()
-                noisy_img = sample['noisy_ir'].squeeze().cpu().numpy()
+                noisy_img = sample['low_ir'].squeeze().cpu().numpy()
                 pred_img = pred_ir.squeeze().cpu().numpy()
                 
                 # 绘制对比图
@@ -149,18 +279,18 @@ def train_model(RGB_img, IR_img,pretrained_path=None):
                 plt.axis('off')
                 
                 # 保存图像
-                plt.savefig(f'C:/Codes/Python/IR_RGB_SR/results/compare_epoch_{epoch+1}.png')
+                plt.savefig(f'./results/compare_epoch_{epoch+1}.png')
                 plt.close()
             
             model.train()  # 恢复训练模式
     
     # 保存模型
-    torch.save(model.state_dict(), 'C:/Codes/Python/IR_RGB_SR/checkout/infrared_fusion_model.pth')
-    print("训练完成，模型已保存为 infrared_fusion_model.pth")
+    torch.save(model.state_dict(), 'checkout/final_model.pth')
+    print("训练完成，模型已保存")
 
-def test_model(ir_path, rgb_path, pretrained_path):
+def test_model(ir_path, rgb_path, train_ir_path,pretrained_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 256
+    img_size = 600
     
     # 初始化模型
     model = InfraredFourierFusionModel(
@@ -184,6 +314,10 @@ def test_model(ir_path, rgb_path, pretrained_path):
         ir_img = Image.open(ir_path).convert('L')
         ir_tensor = transform(ir_img).unsqueeze(0).to(device)
         
+        #训练时的ir图像
+        ir_train = Image.open(train_ir_path).convert('L')
+        ir_train_tensor = transform(ir_train).unsqueeze(0).to(device)
+        
         # 处理RGB图像
         rgb_img = Image.open(rgb_path).convert('RGB')
         rgb_tensor = transform(rgb_img)
@@ -193,44 +327,56 @@ def test_model(ir_path, rgb_path, pretrained_path):
         enhanced_ir = model(ir_tensor, rgb_tensor)
         
         # 转换为numpy
-        input_img = ir_tensor.squeeze().cpu().numpy()
+        input_img_ir = ir_tensor.squeeze().cpu().numpy()
+        train_img_ir = ir_train_tensor.squeeze().cpu().numpy()
         output_img = enhanced_ir.squeeze().cpu().numpy()
         
         # 绘制对比图
         plt.figure(figsize=(10,5))
-        plt.subplot(1,2,1)
-        plt.imshow(input_img, cmap='gray')
-        plt.title('Input Infrared')
+        plt.subplot(1,3,1)
+        plt.imshow(input_img_ir, cmap='gray')
+        plt.title('gt Infrared')
         plt.axis('off')
         
-        plt.subplot(1,2,2)
+        plt.subplot(1,3,2)
+        plt.imshow(train_img_ir, cmap='gray')
+        plt.title('input Infrared')
+        plt.axis('off')
+        
+        plt.subplot(1,3,3)
         plt.imshow(output_img, cmap='gray')
         plt.title('Enhanced Infrared')
         plt.axis('off')
         
         # 保存结果
-        plt.savefig('C:/Codes/Python/IR_RGB_SR/results/test_comparison.png')
+        plt.savefig('./results/test_comparison.png')
         plt.close()
         print("测试完成，结果已保存至 results/test_comparison.png")          
     
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true', help='运行模式: train 或 test')
+    parser.add_argument('--outdir', type=str, default='./results', help='结果存储results')
+    
+    return parser.parse_args()
     
 if __name__ == "__main__":
-    data_dir_1 = {
-        'rgb':'C:/Codes/Python/IR_RGB_SR/data/RoadScene-master/crop_LR_visible',
-        'ir' :'C:/Codes/Python/IR_RGB_SR/data/RoadScene-master/cropinfrared'
+    args = parse_args()
+    data_dir = {
+        'rgb':'./data/train/Visible',
+        'ir' :'./data/train/Infrared',
+        'low_ir':'./data/train/VisibletoIR'
     }
-    data_dir_2 = {
-        'rgb':'C:/Codes/Python/IR_RGB_SR/data/train/Visible',
-        'ir' :'C:/Codes/Python/IR_RGB_SR/data/train/Infrared'
-    }
-    train_model(
-        RGB_img=data_dir_2['rgb'],
-        IR_img=data_dir_2['ir'],
-        pretrained_path='C:/Codes/Python/IR_RGB_SR/checkout/infrared_fusion_model.pth'
-    )
-    # test_model(
-    #     ir_path='C:/Codes/Python/IR_RGB_SR/data/RoadScene-master/cropinfrared/FLIR_00006.jpg',
-    #     rgb_path='C:/Codes/Python/IR_RGB_SR/data/RoadScene-master/crop_LR_visible/FLIR_00006.jpg',
-    #     pretrained_path='C:/Codes/Python/IR_RGB_SR/checkout/infrared_fusion_model.pth'
-    # )
+    if args.train:
+        train_model(
+            RGB_img=data_dir['rgb'],
+            IR_img=data_dir['ir'],
+            low_IR=data_dir['low_ir'],
+        )
+    else:
+        test_model(
+            ir_path=f'{data_dir["ir"]}/00006.png',
+            rgb_path=f'{data_dir["rgb"]}/00006.png',
+            pretrained_path='./checkout/infrared_fusion_model.pth'
+        )
         

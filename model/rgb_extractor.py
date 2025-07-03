@@ -94,8 +94,14 @@ class FourierFeatureExtractor(nn.Module):
         # 3. 应用可学习频域滤波器
         filtered_fft = self.freq_filter(features_fft_shifted)
         
+        #改进，添加残差链接
+        res_filtered_features_fft = features_fft_shifted + filtered_fft
+        
         # 4. 反变换回空间域 (可选)
-        filtered_fft_unshifted = torch.fft.ifftshift(filtered_fft)
+        # filtered_fft_unshifted = torch.fft.ifftshift(filtered_fft)
+        # filtered_spatial = torch.fft.ifft2(filtered_fft_unshifted).real
+        
+        filtered_fft_unshifted = torch.fft.ifftshift(res_filtered_features_fft)
         filtered_spatial = torch.fft.ifft2(filtered_fft_unshifted).real
         
         return {
