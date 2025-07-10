@@ -408,8 +408,8 @@ if __name__ == "__main__":
     args = parse_args()
     data_dir = {
         'rgb':'./data/train/Visible',
-        'ir' :'./data/train/Infrared',
-        'low_ir':'./data/train/VisibletoIR'
+        'ir' :'./data/train/Infrared_enhance',
+        'low_ir':'./data/train/Infrared'
     }
     if args.train:
         train_model(
