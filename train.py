@@ -9,6 +9,7 @@ from PIL import Image
 import os
 from model.fusion import InfraredFourierFusionModel
 import argparse
+import tqdm
 
 # 自定义数据集类
 class NoisyInfraredDataset(Dataset):
@@ -162,40 +163,21 @@ class CombinedLoss(nn.Module):
         }
 
 # 训练配置
-def train_model(RGB_img, IR_img, low_IR,cudaID = None,pretrained_path=None,batch_size = 4):
+def train_model(RGB_img, IR_img, low_IR,cudaID = [],pretrained_path=None,batch_size = 4):
     # 初始化配置
     img_size = (512,512)
-    # batch_size = 8
-    epochs = 100
+    epochs = 50
     
-    # 检查可用GPU数量
-    if cudaID is None:
-        # 自动选择显存充足的GPU
-        available_devices = []
-        for device_id in range(torch.cuda.device_count()):
-            total_mem = torch.cuda.get_device_properties(device_id).total_memory / (1024**3)  # 总显存(GB)
-            used_mem = torch.cuda.memory_allocated(device_id) / (1024**3)  # 已用显存
-            free_mem = total_mem - used_mem
-            
-            if free_mem >= 20 and len(available_devices) < 1:  # 筛选剩余显存>=20GB的卡 最多选取3张
-                available_devices.append(device_id)
         
-        if len(available_devices) == 0:
-            device = torch.device("cpu")
-            num_gpus = 0
-            print("警告：未找到剩余显存≥20GB的GPU，将使用CPU")
-        else:
-            num_gpus = len(available_devices)
-            device = torch.device(f"cuda:{available_devices[0]}")
-            print(f"找到 {num_gpus} 个符合要求的GPU: {available_devices}")
+    num_gpus = len(cudaID)
+    if num_gpus == 0:
+        device = torch.device("cpu")
+        print("警告：未指定GPU，将使用CPU")
     else:
-        # 指定单个GPU
-        num_gpus = 1
-        device = torch.device(f"cuda:{cudaID}")
+        device = torch.device(f"cuda:{cudaID[0]}")
         batch_size = 8
-        
+        print(f"指定 {num_gpus} 个GPU: {cudaID}  batch_size:{batch_size}")         
     
-    print(f"检测到 {num_gpus} 个可用的GPU")
     
     # 初始化模型
     model = InfraredFourierFusionModel(
@@ -204,7 +186,7 @@ def train_model(RGB_img, IR_img, low_IR,cudaID = None,pretrained_path=None,batch
     )
     if num_gpus > 1:
         print(f"使用 {num_gpus} 个GPU进行并行训练")
-        model = nn.DataParallel(model,device_ids = available_devices)
+        model = nn.DataParallel(model,device_ids = cudaID)
     model = model.to(device)
     
     
@@ -342,65 +324,6 @@ def train_model(RGB_img, IR_img, low_IR,cudaID = None,pretrained_path=None,batch
     torch.save(model.state_dict(), 'checkout/final_model.pth')
     print("训练完成，模型已保存")
 
-def test_model(ir_test_dir,rgb_test_dir, pretrained_path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = 512  # 保持与训练尺寸一致
-    
-    # 初始化模型
-    model = InfraredFourierFusionModel(
-        img_size=(img_size, img_size),
-        origianl_channels=16
-    ).to(device)
-    model.load_state_dict(torch.load(pretrained_path, map_location=device))
-    model.eval()
-    
-    # 图像预处理（保持与训练一致）
-    transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-    ])
-    
-    # 创建结果目录
-    os.makedirs('./results/test_results', exist_ok=True)
-    
-    # 获取测试图像路径
-    test_files = sorted([f for f in os.listdir(ir_test_dir) if f.endswith('.png')])
-    rgb_test_dir
-    
-    with torch.no_grad():
-        for filename in test_files:
-            ir_path = os.path.join(ir_test_dir, filename)
-            
-            # 处理红外图像
-            ir_img = Image.open(ir_path).convert('L')
-            ir_tensor = transform(ir_img).unsqueeze(0).to(device)
-            
-            # 模型推理（使用空RGB输入）
-            dummy_rgb = torch.zeros(1, 3, img_size, img_size).to(device)  # 假设RGB非必要输入
-            enhanced_ir = model(ir_tensor, dummy_rgb)
-            
-            # 转换为numpy
-            input_img = ir_tensor.squeeze().cpu().numpy()
-            output_img = enhanced_ir.squeeze().cpu().numpy()
-            
-            # 绘制对比图
-            plt.figure(figsize=(10,5))
-            plt.subplot(1,2,1)
-            plt.imshow(input_img, cmap='gray')
-            plt.title('Input Infrared')
-            plt.axis('off')
-            
-            plt.subplot(1,2,2)
-            plt.imshow(output_img, cmap='gray')
-            plt.title('Enhanced Infrared')
-            plt.axis('off')
-            
-            # 保存结果
-            plt.savefig(f'./results/test_results/{filename}')
-            plt.close()
-    
-    print(f"测试完成，{len(test_files)} 个结果已保存至 results/test_results/")          
-    
     
 def test_model(ir_test_dir, rgb_test_dir, pretrained_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -411,7 +334,18 @@ def test_model(ir_test_dir, rgb_test_dir, pretrained_path):
         img_size=(img_size, img_size),
         origianl_channels=16
     ).to(device)
-    model.load_state_dict(torch.load(pretrained_path, map_location=device))
+    
+    state_dict = torch.load(pretrained_path, map_location=device)
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        # 移除"module."前缀（如果存在） 多卡训练权重会带module前缀
+        if key.startswith("module."):
+            new_key = key[7:]  # 去除前7个字符（"module."）
+        else:
+            new_key = key
+        new_state_dict[new_key] = value
+    
+    model.load_state_dict(new_state_dict)
     model.eval()
     
     # 图像预处理（保持与训练一致）
@@ -447,22 +381,27 @@ def test_model(ir_test_dir, rgb_test_dir, pretrained_path):
             # 处理RGB图像
             rgb_img = Image.open(rgb_path).convert('RGB')
             rgb_tensor = transform(rgb_img)
-            rgb_tensor = rgb_normalize(rgb_tensor).unsqueeze(0).to(device)
+            rgb_tensor_norm = rgb_normalize(rgb_tensor).unsqueeze(0).to(device)
             
             # 模型推理
-            enhanced_ir = model(ir_tensor, rgb_tensor)
+            enhanced_ir = model(ir_tensor, rgb_tensor_norm)
             
             input_ir = ir_tensor.squeeze().cpu().numpy()
-            # input_rgb = rgb_img.squeeze().cpu().numpy()
+            input_rgb = rgb_tensor.squeeze().cpu().permute(1,2,0).numpy()
             output_ir = enhanced_ir.squeeze().cpu().numpy()
              # 绘制对比图
             plt.figure(figsize=(10,5))
-            plt.subplot(1,2,1)
+            plt.subplot(1,3,1)
+            plt.imshow(input_rgb)
+            plt.title('Input Visiable')
+            plt.axis('off')
+            
+            plt.subplot(1,3,2)
             plt.imshow(input_ir, cmap='gray')
             plt.title('Input Infrared')
             plt.axis('off')
             
-            plt.subplot(1,2,2)
+            plt.subplot(1,3,3)
             plt.imshow(output_ir, cmap='gray')
             plt.title('Enhanced Infrared')
             plt.axis('off')
@@ -493,7 +432,7 @@ if __name__ == "__main__":
             RGB_img=data_dir['rgb'],
             IR_img=data_dir['ir'],
             low_IR=data_dir['low_ir'],
-            # cudaID= 1
+            cudaID= [1,2]# 0,1,2,3
         )
     else:
         test_model(

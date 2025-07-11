@@ -28,10 +28,6 @@ class InfraredFeatureExtractor(nn.Module):
         self.feat_H = img_size[0]
         self.feat_W = img_size[1]
         
-        # 红外图像特定处理参数
-        self.temperature_scaler = nn.Parameter(torch.tensor(1.0))  # 温度缩放因子
-        self.thermal_noise = GaussianBlur(3, sigma=(0.1, 2.0))  # 模拟热噪声
-        
         # 1. 卷积特征提取层 - 固定输出尺寸
         self.conv_layers = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, 5, padding=2),
@@ -72,8 +68,6 @@ class InfraredFeatureExtractor(nn.Module):
         self.norm = nn.BatchNorm2d(self.final_channels)
 
     def forward(self, x):
-        # 红外图像预处理 - 模拟热特性
-        x = self.thermal_noise(x) * self.temperature_scaler
         
         # 1. 卷积特征提取 - 尺寸固定为 (H, W)
         features = self.conv_layers(x)
@@ -226,13 +220,6 @@ def visualize_results(results, original_img,model):
     plt.title(f"权重最高通道 ({top_channel}) - 增强后")
     plt.colorbar()
     
-    # 学习到的温度缩放因子
-    plt.subplot(3, 4, 12)
-    plt.text(0.1, 0.5, f"温度缩放因子: {model.temperature_scaler.item():.3f}\n"
-             f"特征图尺寸: {model.feat_H}x{model.feat_W}\n"
-             f"滤波器尺寸: {learned_filter.shape[0]}x{learned_filter.shape[1]}x{learned_filter.shape[2]}",  # 修正索引
-             fontsize=10, bbox=dict(facecolor='white', alpha=0.8))
-    plt.axis('off')
     
     plt.tight_layout()
     plt.show()
