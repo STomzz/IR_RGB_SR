@@ -9,7 +9,8 @@ from PIL import Image
 import os
 from model.fusion import InfraredFourierFusionModel
 import argparse
-from datetime import datetime  # 导入datetime模块
+from torch.quantization import prepare_qat, convert
+from train import load_multi_GPU_pretrain_model
 
 # 自定义数据集类
 class NoisyInfraredDataset(Dataset):
@@ -162,88 +163,51 @@ class CombinedLoss(nn.Module):
             "gradient": grad.item()
         }
 
-# 训练配置
-def train_model(RGB_img, IR_img, low_IR,cudaID = [],pretrained_path=None,batch_size = 4):
-    # 初始化配置
-    img_size = (512,512)
+    
+def train_model_qat(RGB_img, IR_img, low_IR,pretrained_path=None,batch_size = 4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    img_size = 512  # 保持与训练尺寸一致
     epochs = 50
-    
-        
-    num_gpus = len(cudaID)
-    if num_gpus == 0:
-        device = torch.device("cpu")
-        print("警告：未指定GPU，将使用CPU")
-    else:
-        device = torch.device(f"cuda:{cudaID[0]}")
-        batch_size = 8
-        print(f"指定 {num_gpus} 个GPU: {cudaID}  batch_size:{batch_size}")         
-    
     
     # 初始化模型
     model = InfraredFourierFusionModel(
-        img_size=img_size,
+        img_size=(img_size, img_size),
         origianl_channels=16
-    )
-    if num_gpus > 1:
-        print(f"使用 {num_gpus} 个GPU进行并行训练")
-        model = nn.DataParallel(model,device_ids = cudaID)
-    model = model.to(device)
+    ).to(device)
     
-    #多卡训练加载可能失败，正确参考test_model
-    if pretrained_path:
-        try:
-            # 处理多GPU训练模型的状态字典
-            state_dict = torch.load(pretrained_path, map_location=device)
-            if num_gpus <= 1 and any(key.startswith('module.') for key in state_dict):
-                # 如果预训练模型是多GPU训练的，但当前使用单GPU
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            elif num_gpus > 1 and not any(key.startswith('module.') for key in state_dict):
-                # 如果预训练模型是单GPU训练的，但当前使用多GPU
-                state_dict = {'module.' + k: v for k, v in state_dict.items()}
-            
-            model.load_state_dict(state_dict)
-            print(f"成功加载预训练权重: {pretrained_path}")
-        except Exception as e:
-            print(f"加载预训练权重失败: {str(e)}")
+    model = load_multi_GPU_pretrain_model(model=model,pretrained_path=pretrained_path,device=device)
+    model.train()
     
-    # 定义损失函数和优化器
-    criterion =  nn.L1Loss()
-    # criterion = CombinedLoss(device=device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    #================配置QAT模型============
+    model.qconfig = torch.quantization.get_default_qat_qconfig('qnnpack')
+    model_qat = prepare_qat(model)
+    optimizer = torch.optim.Adam(model_qat.parameters(), lr=0.001)
+    # criterion =  nn.L1Loss()
+    criterion = CombinedLoss(device=device)
     
-    #可调整学习率
-    def lr_lambda(epoch):
-        return 0.1 ** (epoch // 20) #每20个epoch学习率降低10倍
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda)
+    # 冻结BN层参数
+    model_qat.apply(torch.quantization.disable_observer)  # 冻结Observer
+    model_qat.apply(torch.nn.intrinsic.qat.freeze_bn_stats)  # 冻结BN统计量
     
     # 创建数据集和数据加载器
     train_dataset = NoisyInfraredDataset(
         IR_img=IR_img,
         RGB_img=RGB_img,
         low_IR=low_IR,
-        img_size=img_size,
+        # img_size=img_size,
         
     )
-    
-    # 根据GPU数量调整批次大小
-    effective_batch_size = batch_size * max(1, num_gpus)
-    print(f"实际批次大小: {effective_batch_size} (每个GPU: {batch_size})")
-    
     train_loader = DataLoader(train_dataset, 
-                             batch_size=effective_batch_size, 
+                             batch_size=4, 
                              shuffle=True,
-                             num_workers=4 * num_gpus,  # 根据GPU数量增加工作线程
+                             num_workers=0 ,  # 根据GPU数量增加工作线程
                              pin_memory=True)  # 加速数据传输
     
-    # train_loader = DataLoader(train_dataset, 
-    #                          batch_size=batch_size, 
-    #                          shuffle=True,
-    #                          num_workers=0)
-   
-    # 训练循环
+    # 创建结果目录
+    os.makedirs('./results/qat_results', exist_ok=True)
+    
     for epoch in range(epochs):
-        model.train()
+        model_qat.train()
         running_loss = 0.0
         
         for batch_idx, batch in enumerate(train_loader):
@@ -252,11 +216,22 @@ def train_model(RGB_img, IR_img, low_IR,cudaID = [],pretrained_path=None,batch_s
             clean_ir = batch['clean_ir'].to(device)
             
             optimizer.zero_grad()
-            outputs = model(low_ir, rgb)  # 输入low红外和RGB
-            # loss = criterion(outputs, clean_ir)['total']  # 与干净红外比较(conbined loss)
-            loss = criterion(outputs, clean_ir) #L1 loss
+            outputs = model_qat(low_ir, rgb)  # 输入low红外和RGB
+            loss = criterion(outputs, clean_ir)['total']  # 与干净红外比较(conbined loss)
+            # loss = criterion(outputs, clean_ir) #L1 loss
             
             loss.backward()
+            
+            #====打印梯度信息===
+            total_norm = 0
+            for p in model_qat.parameters():
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            print(f' Gradient Norm: {total_norm:.4f}')
+            
+            
+            #====更新权重====
             optimizer.step()
             
             # 统计损失
@@ -265,24 +240,13 @@ def train_model(RGB_img, IR_img, low_IR,cudaID = [],pretrained_path=None,batch_s
             # 每10个batch打印进度
             if batch_idx % 10 == 9:
                 print(f'Epoch [{epoch+1}/{epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
-                
-           
         
         # 每个epoch的平均损失
         epoch_loss = running_loss / len(train_loader)
         print(f'Epoch [{epoch+1}/{epochs}] completed, Average Loss:================ {epoch_loss:.4f}==============')
-        #当前学习率
-        print(f"Epoch [{epoch+1}/{epochs}] - 当前学习率: { optimizer.param_groups[0]['lr']:.11f}")
-        #学习率更新
-        scheduler.step() 
-        
-        
         # 每10个epoch结束后保存对比图
         if (epoch + 1) % 10 == 0:
-            model.eval()
-            
-            torch.save(model.state_dict(), f'checkout/temp_model_epoch{epoch+1}.pth')
-            print("临时模型已保存")
+            model_qat.eval()
             with torch.no_grad():
                 # 获取一个测试样本
                 sample = train_dataset[0]
@@ -290,7 +254,7 @@ def train_model(RGB_img, IR_img, low_IR,cudaID = [],pretrained_path=None,batch_s
                 rgb = sample['rgb'].unsqueeze(0).to(device)
                 
                 # 生成预测
-                pred_ir = model(low_ir, rgb)
+                pred_ir = model_qat(low_ir, rgb)
                 
                 # 转换为numpy图像
                 clean_img = sample['clean_ir'].squeeze().cpu().numpy()
@@ -315,128 +279,13 @@ def train_model(RGB_img, IR_img, low_IR,cudaID = [],pretrained_path=None,batch_s
                 plt.axis('off')
                 
                 # 保存图像
-                plt.savefig(f'./results/compare_epoch_{epoch+1}.png')
+                plt.savefig(f'./results/qat_results/compare_epoch_{epoch+1}.png')
                 plt.close()
             
             model.train()  # 恢复训练模式
-    
-    # 保存模型
-    current_date = datetime.now().strftime("%Y%m%d")
-    torch.save(model.state_dict(), f'checkout/final_model_{current_date}.pth')
-    print("训练完成，模型已保存")
-
-
-def load_multi_GPU_pretrain_model(model,pretrained_path = None,device = None):
-    if pretrained_path is None:
-        raise ValueError("预训练模型路径 pretrained_path 不能为 None")
-    if device is None:
-        raise ValueError("设备 device 不能为 None")
-    state_dict = torch.load(pretrained_path, map_location=device)
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        # 移除"module."前缀（如果存在） 多卡训练权重会带module前缀
-        if key.startswith("module."):
-            new_key = key[7:]  # 去除前7个字符（"module."）
-        else:
-            new_key = key
-        new_state_dict[new_key] = value
-    
-    model.load_state_dict(new_state_dict)
-    return model
-    
-
-def test_model(ir_test_dir, rgb_test_dir, pretrained_path, cudaID = 0):
-    img_size = 512  # 保持与训练尺寸一致
-    
-    # 初始化模型
-    model = InfraredFourierFusionModel(
-        img_size=(img_size, img_size),
-        origianl_channels=16
-    )
-    assert(cudaID < torch.cuda.device_count())
-    device = torch.device(f"cuda:{cudaID}" if torch.cuda.is_available() else "cpu")
-    
-    #加载模型
-    # assert(cudaID < torch.cuda.device_count())
-    # device = torch.device(f"cuda:{cudaID}" if torch.cuda.is_available() else "cpu")
-    
-    # state_dict = torch.load(pretrained_path, map_location=device)
-    # new_state_dict = {}
-    # for key, value in state_dict.items():
-    #     # 移除"module."前缀（如果存在） 多卡训练权重会带module前缀
-    #     if key.startswith("module."):
-    #         new_key = key[7:]  # 去除前7个字符（"module."）
-    #     else:
-    #         new_key = key
-    #     new_state_dict[new_key] = value
-    
-    # model.load_state_dict(new_state_dict)
-    model = load_multi_GPU_pretrain_model(model=model,pretrained_path=pretrained_path,device=device)
-    model.eval().to(device)
-    
-    # 图像预处理（保持与训练一致）
-    transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-    ])
-    rgb_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                        std=[0.229, 0.224, 0.225])
-    
-    # 创建结果目录
-    os.makedirs('./results/test_results', exist_ok=True)
-    
-    # 获取测试图像路径
-    ir_files = sorted([f for f in os.listdir(ir_test_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    rgb_files = sorted([f for f in os.listdir(rgb_test_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    
-    # 确保文件数量匹配
-    min_files = min(len(ir_files), len(rgb_files))
-    if min_files == 0:
-        print("错误：测试目录中没有图像文件")
-        return
-    
-    with torch.no_grad():
-        for i in range(min_files):
-            ir_path = os.path.join(ir_test_dir, ir_files[i])
-            rgb_path = os.path.join(rgb_test_dir, rgb_files[i])
-            
-            # 处理红外图像
-            ir_img = Image.open(ir_path).convert('L')
-            ir_tensor = transform(ir_img).unsqueeze(0).to(device)
-            
-            # 处理RGB图像
-            rgb_img = Image.open(rgb_path).convert('RGB')
-            rgb_tensor = transform(rgb_img)
-            rgb_tensor_norm = rgb_normalize(rgb_tensor).unsqueeze(0).to(device)
-            
-            # 模型推理
-            enhanced_ir = model(ir_tensor, rgb_tensor_norm)
-            
-            input_ir = ir_tensor.squeeze().cpu().numpy()
-            input_rgb = rgb_tensor.squeeze().cpu().permute(1,2,0).numpy()
-            output_ir = enhanced_ir.squeeze().cpu().numpy()
-             # 绘制对比图
-            plt.figure(figsize=(10,5))
-            plt.subplot(1,3,1)
-            plt.imshow(input_rgb)
-            plt.title('Input Visiable')
-            plt.axis('off')
-            
-            plt.subplot(1,3,2)
-            plt.imshow(input_ir, cmap='gray')
-            plt.title('Input Infrared')
-            plt.axis('off')
-            
-            plt.subplot(1,3,3)
-            plt.imshow(output_ir, cmap='gray')
-            plt.title('Enhanced Infrared')
-            plt.axis('off')
-            
-            # 保存结果
-            plt.savefig(f'./results/test_results/{ir_files[i]}')
-            plt.close()
-    
-    print(f"测试完成")
+    model_qat.eval()
+    model_int8 = convert(model_qat)
+    torch.jit.save(torch.jit.script(model_int8),'./checkout/qat_model.pth')
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true', help='运行模式: train 或 test')
@@ -454,17 +303,9 @@ if __name__ == "__main__":
         'rgb_test':'./data/test/Visible'
     }
     if args.train:
-        train_model(
+        train_model_qat(
             RGB_img=data_dir['rgb'],
             IR_img=data_dir['ir'],
             low_IR=data_dir['low_ir'],
-            cudaID= [1,2]# 0,1,2,3
+            pretrained_path = './checkout/final_model.pth'
         )
-    else:
-        test_model(
-            ir_test_dir=data_dir['ir_test'],
-            rgb_test_dir=data_dir['rgb_test'],
-            pretrained_path='./checkout/final_model.pth',
-            cudaID= 1
-        )
-        
